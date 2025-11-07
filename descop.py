@@ -1,963 +1,883 @@
-# tracking_app_tk_api.py
-# Tkinter UI "как в первой версии", но с логикой работы через REST API
-# API совместим с: https://tracking-api-b4jb.onrender.com
-# Вкладки: Сканування / Історія / Помилки / Довідка
-# Офлайн-очередь: локальная SQLite (offline_queue.db), авто-синхронизация раз в 60 сек
+"""TrackingApp for Windows."""
+from __future__ import annotations
 
 import json
-import os
-import sqlite3
-import sys
-import time
-from datetime import datetime
+import threading
+from dataclasses import dataclass, asdict
+from datetime import datetime, date, time as dtime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
-import requests
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
-from tkcalendar import DateEntry
+from tkinter import ttk, messagebox, simpledialog
 
-# ------------------ Константы ------------------
+try:
+    import requests
+except ImportError as exc:  # pragma: no cover - handled at runtime
+    raise SystemExit(
+        "The 'requests' package is required. Install it with 'pip install requests'."
+    ) from exc
 
-BASE_URL = "https://tracking-api-b4jb.onrender.com"
-
-APP_DIR = Path.home() / ".trackingapp_tk"
-APP_DIR.mkdir(parents=True, exist_ok=True)
-OFFLINE_DB_PATH = APP_DIR / "offline_queue.db"
-CONFIG_PATH = APP_DIR / "config.json"
-HELP_PATH = APP_DIR / "help.txt"
-
-SYNC_INTERVAL_MS = 60_000  # 60 секунд
+API_BASE = "https://tracking-api-b4jb.onrender.com"
+STATE_PATH = Path(__file__).with_name("tracking_app_state.json")
+QUEUE_PATH = Path(__file__).with_name("offline_queue.json")
 
 
-# ------------------ Конфигурация ------------------
+@dataclass
+class AppState:
+    token: Optional[str] = None
+    access_level: int = 2
+    last_password: str = ""
+    user_name: str = "operator"
 
-def load_config() -> Dict[str, Any]:
-    if CONFIG_PATH.exists():
-        try:
-            return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return {
-        "token": None,
-        "access_level": 2,
-        "last_password": "",
-        "user_name": "",
-    }
-
-
-def save_config(cfg: Dict[str, Any]) -> None:
-    try:
-        CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        pass
-
-
-CONFIG = load_config()
-
-
-# ------------------ Офлайн-очередь (SQLite) ------------------
-
-def _ensure_offline_schema(conn: sqlite3.Connection) -> None:
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS queue (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            payload TEXT NOT NULL
-        )
-    """)
-    conn.commit()
-
-
-def _open_offline_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(OFFLINE_DB_PATH))
-    _ensure_offline_schema(conn)
-    return conn
-
-
-def enqueue_offline(record: Dict[str, str]) -> None:
-    try:
-        payload = json.dumps(record, ensure_ascii=False)
-        with _open_offline_conn() as conn:
-            conn.execute("INSERT INTO queue(payload) VALUES (?)", (payload,))
-            conn.commit()
-    except Exception:
-        pass
-
-
-def dequeue_all_offline() -> List[Dict[str, str]]:
-    data: List[Dict[str, str]] = []
-    try:
-        with _open_offline_conn() as conn:
-            cur = conn.execute("SELECT id, payload FROM queue ORDER BY id ASC")
-            rows = cur.fetchall()
-            ids = []
-            for row_id, payload in rows:
-                try:
-                    data.append(json.loads(payload))
-                except Exception:
-                    pass
-                ids.append(row_id)
-            if ids:
-                conn.executemany("DELETE FROM queue WHERE id = ?", ((i,) for i in ids))
-                conn.commit()
-    except Exception:
-        pass
-    return data
-
-
-def pending_offline_count() -> int:
-    try:
-        with _open_offline_conn() as conn:
-            cur = conn.execute("SELECT COUNT(*) FROM queue")
-            (count,) = cur.fetchone()
-            return int(count)
-    except Exception:
-        return 0
-
-
-# ------------------ API клиент ------------------
-
-class ApiError(RuntimeError):
-    pass
-
-
-class ApiClient:
-    def __init__(self, base_url: str = BASE_URL) -> None:
-        self.base_url = base_url.rstrip("/")
-
-    def _handle(self, resp: requests.Response) -> Any:
-        if resp.status_code >= 400:
+    @classmethod
+    def load(cls) -> "AppState":
+        if STATE_PATH.exists():
             try:
-                body = resp.json()
+                data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+                return cls(**data)
             except Exception:
-                body = resp.text
-            raise ApiError(f"HTTP {resp.status_code}: {body}")
-        if not resp.content:
+                STATE_PATH.unlink(missing_ok=True)
+        return cls()
+
+    def save(self) -> None:
+        STATE_PATH.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
+
+
+class OfflineQueue:
+    _lock = threading.Lock()
+
+    @staticmethod
+    def _load() -> List[Dict[str, Any]]:
+        if QUEUE_PATH.exists():
+            try:
+                return json.loads(QUEUE_PATH.read_text(encoding="utf-8"))
+            except Exception:
+                QUEUE_PATH.unlink(missing_ok=True)
+        return []
+
+    @classmethod
+    def add_record(cls, record: Dict[str, Any]) -> None:
+        with cls._lock:
+            pending = cls._load()
+            pending.append(record)
+            QUEUE_PATH.write_text(json.dumps(pending, indent=2), encoding="utf-8")
+
+    @classmethod
+    def sync_pending(
+        cls, token: str, callback: Optional[Callable[[int], None]] = None
+    ) -> None:
+        def worker() -> None:
+            with cls._lock:
+                pending = cls._load()
+            if not pending or not token:
+                return
+            synced: List[Dict[str, Any]] = []
+            for record in pending:
+                try:
+                    response = requests.post(
+                        f"{API_BASE}/add_record",
+                        json=record,
+                        headers={
+                            "Authorization": f"Bearer {token}",
+                            "Content-Type": "application/json",
+                        },
+                        timeout=10,
+                    )
+                    if response.status_code == 200:
+                        synced.append(record)
+                except requests.RequestException:
+                    break
+            if synced:
+                with cls._lock:
+                    remaining = [r for r in cls._load() if r not in synced]
+                    QUEUE_PATH.write_text(
+                        json.dumps(remaining, indent=2), encoding="utf-8"
+                    )
+            if callback:
+                callback(len(synced))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+
+def get_role_info(access_level: int, password: str) -> Dict[str, Any]:
+    if access_level == 1 or password == "301993":
+        return {"label": "🔑 Адмін", "color": "#e53935", "can_clear_history": True, "can_clear_errors": True}
+    if password == "123123123":
+        return {"label": "🧰 Очищення помилок", "color": "#fb8c00", "can_clear_history": False, "can_clear_errors": True}
+    if access_level == 0:
+        return {"label": "🧰 Оператор", "color": "#1e88e5", "can_clear_history": False, "can_clear_errors": False}
+    return {"label": "👁 Перегляд", "color": "#757575", "can_clear_history": False, "can_clear_errors": False}
+
+
+class TrackingApp(tk.Tk):
+    def __init__(self) -> None:
+        super().__init__()
+        self.title("TrackingApp Windows Edition")
+        self.geometry("1280x800")
+        self.minsize(1100, 720)
+        self.configure(bg="#0d47a1")
+
+        self.state_data = AppState.load()
+        self._current_frame: Optional[tk.Frame] = None
+
+        self.style = ttk.Style(self)
+        self.style.configure("TButton", font=("Segoe UI", 14), padding=10)
+        self.style.configure("TLabel", font=("Segoe UI", 14))
+        self.style.configure("TEntry", font=("Segoe UI", 16))
+
+        if self.state_data.token and self.state_data.user_name:
+            self.show_scanner()
+        elif self.state_data.token:
+            self.show_username()
+        else:
+            self.show_login()
+
+    def switch_to(self, frame_cls: type[tk.Frame]) -> None:
+        if self._current_frame is not None:
+            self._current_frame.destroy()
+        frame = frame_cls(self)
+        frame.pack(fill="both", expand=True)
+        self._current_frame = frame
+
+    def show_login(self) -> None:
+        self.switch_to(LoginFrame)
+
+    def show_username(self) -> None:
+        self.switch_to(UserNameFrame)
+
+    def show_scanner(self) -> None:
+        self.switch_to(ScannerFrame)
+
+
+class LoginFrame(tk.Frame):
+    def __init__(self, app: TrackingApp) -> None:
+        super().__init__(app, bg="#0d47a1")
+        self.app = app
+        self.password_var = tk.StringVar()
+        self.error_var = tk.StringVar()
+        self.loading = False
+
+        container = tk.Frame(self, bg="#0d47a1")
+        container.place(relx=0.5, rely=0.5, anchor="center")
+
+        logo = tk.Label(container, text="TrackingApp", font=("Segoe UI", 42, "bold"), fg="white", bg="#0d47a1")
+        logo.pack(pady=20)
+
+        prompt = tk.Label(
+            container,
+            text="Вітаю! Введіть пароль",
+            font=("Segoe UI", 24, "bold"),
+            fg="white",
+            bg="#0d47a1",
+        )
+        prompt.pack(pady=(0, 30))
+
+        entry = ttk.Entry(container, textvariable=self.password_var, show="*")
+        entry.pack(ipadx=20, ipady=12)
+        entry.bind("<Return>", lambda _: self.login())
+
+        self.error_label = tk.Label(
+            container,
+            textvariable=self.error_var,
+            font=("Segoe UI", 14),
+            fg="#ff5252",
+            bg="#0d47a1",
+        )
+        self.error_label.pack(pady=20)
+
+        self.button = ttk.Button(container, text="Увійти", command=self.login)
+        self.button.pack(fill="x", pady=(10, 40))
+
+        footer = tk.Label(
+            container,
+            text="by Dimon VR",
+            font=("Segoe UI", 16, "italic"),
+            fg="white",
+            bg="#0d47a1",
+        )
+        footer.pack()
+
+        entry.focus_set()
+
+    def set_loading(self, value: bool) -> None:
+        self.loading = value
+        if value:
+            self.button.configure(text="Зачекайте...", state="disabled")
+        else:
+            self.button.configure(text="Увійти", state="normal")
+
+    def login(self) -> None:
+        if self.loading:
+            return
+        password = self.password_var.get().strip()
+        if not password:
+            self.error_var.set("Введіть пароль")
+            return
+
+        def worker() -> None:
+            try:
+                response = requests.post(
+                    f"{API_BASE}/login",
+                    params={"password": password},
+                    headers={"Accept": "application/json"},
+                    timeout=10,
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    self.app.state_data.token = data.get("token")
+                    self.app.state_data.access_level = data.get("access_level", 2)
+                    self.app.state_data.last_password = password
+                    self.app.state_data.save()
+                    self.after(0, self.app.show_username)
+                else:
+                    try:
+                        message = response.json().get("message", "Невірний пароль")
+                    except Exception:
+                        message = "Невірний пароль"
+                    self.after(0, lambda: self.error_var.set(message))
+            except requests.RequestException:
+                self.after(0, lambda: self.error_var.set("Помилка підключення до сервера"))
+            finally:
+                self.after(0, lambda: self.set_loading(False))
+
+        self.error_var.set("")
+        self.set_loading(True)
+        threading.Thread(target=worker, daemon=True).start()
+
+
+class UserNameFrame(tk.Frame):
+    def __init__(self, app: TrackingApp) -> None:
+        super().__init__(app, bg="#f5f5f5")
+        self.app = app
+        self.name_var = tk.StringVar(value=app.state_data.user_name)
+
+        wrapper = tk.Frame(self, bg="#f5f5f5")
+        wrapper.place(relx=0.5, rely=0.5, anchor="center")
+
+        label = tk.Label(
+            wrapper,
+            text="Введіть ім’я користувача",
+            font=("Segoe UI", 28, "bold"),
+            bg="#f5f5f5",
+        )
+        label.pack(pady=(0, 30))
+
+        entry = ttk.Entry(wrapper, textvariable=self.name_var, justify="center")
+        entry.pack(ipadx=20, ipady=12)
+        entry.bind("<Return>", lambda _: self.save())
+
+        ttk.Button(wrapper, text="Продовжити", command=self.save).pack(
+            fill="x", pady=30
+        )
+
+        entry.focus_set()
+
+    def save(self) -> None:
+        name = self.name_var.get().strip()
+        if not name:
+            messagebox.showwarning("Увага", "Введіть ім’я користувача")
+            return
+        self.app.state_data.user_name = name
+        self.app.state_data.save()
+        self.app.show_scanner()
+
+
+class ScannerFrame(tk.Frame):
+    def __init__(self, app: TrackingApp) -> None:
+        super().__init__(app, bg="#f7f8fa")
+        self.app = app
+        self.box_var = tk.StringVar()
+        self.ttn_var = tk.StringVar()
+        self.status_var = tk.StringVar()
+        self.online_var = tk.StringVar(value="🔄 Перевірка з’єднання...")
+        self.online_color = "#fdd835"
+
+        self.role_info = get_role_info(
+            app.state_data.access_level, app.state_data.last_password
+        )
+
+        top_bar = tk.Frame(self, bg=self.online_color)
+        top_bar.pack(fill="x")
+        self.online_label = tk.Label(
+            top_bar,
+            textvariable=self.online_var,
+            font=("Segoe UI", 16, "bold"),
+            fg="black",
+            bg=self.online_color,
+            pady=8,
+        )
+        self.online_label.pack(fill="x")
+
+        info_panel = tk.Frame(self, bg="white", bd=1, relief="solid")
+        info_panel.pack(fill="x", padx=24, pady=(16, 0))
+
+        left = tk.Frame(info_panel, bg="white")
+        left.pack(side="left", padx=16, pady=12)
+        tk.Label(
+            left,
+            text=f"Оператор: {app.state_data.user_name}",
+            font=("Segoe UI", 20, "bold"),
+            bg="white",
+        ).pack(anchor="w")
+        tk.Label(
+            left,
+            text=self.role_info["label"],
+            font=("Segoe UI", 18),
+            fg=self.role_info["color"],
+            bg="white",
+        ).pack(anchor="w", pady=(4, 0))
+
+        right = tk.Frame(info_panel, bg="white")
+        right.pack(side="right", padx=16, pady=12)
+        self.step_var = tk.StringVar(value="BoxID")
+        tk.Label(
+            right,
+            textvariable=self.step_var,
+            font=("Segoe UI", 24, "bold"),
+            fg="#1e88e5",
+            bg="white",
+        ).pack()
+
+        buttons = tk.Frame(self, bg="#f7f8fa")
+        buttons.pack(anchor="e", padx=24, pady=16)
+        ttk.Button(buttons, text="Історія", command=self.open_history).pack(
+            side="left", padx=6
+        )
+        ttk.Button(buttons, text="Помилки", command=self.open_errors).pack(
+            side="left", padx=6
+        )
+        ttk.Button(buttons, text="Вийти", command=self.logout).pack(
+            side="left", padx=6
+        )
+
+        main = tk.Frame(self, bg="#f7f8fa")
+        main.pack(expand=True)
+        form = tk.Frame(main, bg="white", bd=2, relief="groove")
+        form.pack(padx=80, pady=40, fill="both", expand=True)
+
+        tk.Label(
+            form,
+            textvariable=self.step_var,
+            font=("Segoe UI", 30, "bold"),
+            bg="white",
+        ).pack(pady=(40, 20))
+
+        self.entry = ttk.Entry(form, textvariable=self.box_var, justify="center")
+        self.entry.pack(padx=120, ipadx=40, ipady=18)
+        self.entry.bind("<Return>", lambda _: self.to_next())
+
+        self.ttn_entry = ttk.Entry(form, textvariable=self.ttn_var, justify="center")
+        self.ttn_entry.pack(padx=120, ipadx=40, ipady=18, pady=(30, 0))
+        self.ttn_entry.bind("<Return>", lambda _: self.submit())
+
+        self.ttn_entry.pack_forget()  # start hidden until second step
+
+        status_frame = tk.Frame(form, bg="white")
+        status_frame.pack(pady=40)
+        tk.Label(
+            status_frame,
+            textvariable=self.status_var,
+            font=("Segoe UI", 18),
+            fg="#424242",
+            bg="white",
+            wraplength=700,
+            justify="center",
+        ).pack()
+
+        self.entry.focus_set()
+        self.check_connectivity()
+        OfflineQueue.sync_pending(self.app.state_data.token or "")
+
+    def set_online_state(self, online: bool) -> None:
+        if online:
+            self.online_color = "#43a047"
+            self.online_var.set("🟢 Підключення активне")
+        else:
+            self.online_color = "#e53935"
+            self.online_var.set("🔴 Немає зв’язку з сервером")
+        self.online_label.configure(bg=self.online_color)
+        self.online_label.master.configure(bg=self.online_color)
+
+    def check_connectivity(self) -> None:
+        def worker() -> None:
+            try:
+                response = requests.head(API_BASE, timeout=5)
+                online = response.status_code < 500
+            except requests.RequestException:
+                online = False
+            self.after(0, lambda: self.set_online_state(online))
+            self.after(15000, self.check_connectivity)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def to_next(self) -> None:
+        value = self.box_var.get().strip()
+        if not value:
+            messagebox.showwarning("Увага", "Введіть BoxID")
+            return
+        self.step_var.set("ТТН")
+        self.entry.pack_forget()
+        self.ttn_entry.pack(padx=120, ipadx=40, ipady=18)
+        self.ttn_entry.focus_set()
+
+    def reset_fields(self) -> None:
+        self.box_var.set("")
+        self.ttn_var.set("")
+        self.step_var.set("BoxID")
+        self.ttn_entry.pack_forget()
+        self.entry.pack(padx=120, ipadx=40, ipady=18)
+        self.entry.focus_set()
+
+    def submit(self) -> None:
+        boxid = self.box_var.get().strip()
+        ttn = self.ttn_var.get().strip()
+        if not boxid or not ttn:
+            messagebox.showwarning("Увага", "Введіть BoxID та ТТН")
+            return
+        record = {
+            "user_name": self.app.state_data.user_name,
+            "boxid": boxid,
+            "ttn": ttn,
+        }
+        self.status_var.set("Відправлення...")
+
+        def worker() -> None:
+            token = self.app.state_data.token or ""
+            if not token:
+                OfflineQueue.add_record(record)
+                self.after(
+                    0,
+                    lambda: self.status_var.set(
+                        "📦 Збережено локально. Увійдіть знову, щоб синхронізувати."
+                    ),
+                )
+                self.after(0, self.reset_fields)
+                return
+            try:
+                response = requests.post(
+                    f"{API_BASE}/add_record",
+                    json=record,
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json",
+                    },
+                    timeout=10,
+                )
+                if response.status_code == 200:
+                    note = response.json().get("note", "")
+                    if note:
+                        message = f"⚠️ Дублікат: {note}"
+                    else:
+                        message = "✅ Успішно додано"
+                    self.after(0, lambda: self.status_var.set(message))
+                    self.after(0, lambda: self.set_online_state(True))
+                else:
+                    raise requests.RequestException(f"status {response.status_code}")
+            except requests.RequestException:
+                OfflineQueue.add_record(record)
+                self.after(0, lambda: self.status_var.set("📦 Збережено локально (офлайн)"))
+                self.after(0, lambda: self.set_online_state(False))
+            finally:
+                self.after(0, self.reset_fields)
+                OfflineQueue.sync_pending(token)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def logout(self) -> None:
+        if not messagebox.askyesno("Підтвердження", "Вийти з акаунту?"):
+            return
+        self.app.state_data = AppState()
+        self.app.state_data.save()
+        self.app.show_login()
+
+    def open_history(self) -> None:
+        HistoryWindow(self.app)
+
+    def open_errors(self) -> None:
+        ErrorsWindow(self.app, self.role_info)
+
+
+class HistoryWindow(tk.Toplevel):
+    def __init__(self, app: TrackingApp) -> None:
+        super().__init__(app)
+        self.app = app
+        self.title("Історія сканувань")
+        self.geometry("1000x700")
+
+        self.records: List[Dict[str, Any]] = []
+        self.filtered: List[Dict[str, Any]] = []
+
+        filters = tk.Frame(self)
+        filters.pack(fill="x", padx=12, pady=8)
+
+        self.box_filter = tk.StringVar()
+        self.ttn_filter = tk.StringVar()
+        self.user_filter = tk.StringVar()
+        self.date_filter: Optional[date] = None
+        self.start_time: Optional[dtime] = None
+        self.end_time: Optional[dtime] = None
+
+        self._add_filter_entry(filters, "BoxID", self.box_filter)
+        self._add_filter_entry(filters, "TTN", self.ttn_filter)
+        self._add_filter_entry(filters, "Користувач", self.user_filter)
+
+        ttk.Button(filters, text="Дата", command=self.pick_date).pack(side="left", padx=4)
+        ttk.Button(filters, text="Початок", command=lambda: self.pick_time(True)).pack(side="left", padx=4)
+        ttk.Button(filters, text="Кінець", command=lambda: self.pick_time(False)).pack(side="left", padx=4)
+        ttk.Button(filters, text="Скинути", command=self.clear_filters).pack(side="left", padx=4)
+        ttk.Button(filters, text="Оновити", command=self.fetch_history).pack(side="left", padx=4)
+        if get_role_info(app.state_data.access_level, app.state_data.last_password)["can_clear_history"]:
+            ttk.Button(filters, text="Очистити", command=self.clear_history).pack(side="right", padx=4)
+
+        columns = ("datetime", "boxid", "ttn", "user", "note")
+        self.tree = ttk.Treeview(self, columns=columns, show="headings")
+        headings = {
+            "datetime": "Дата",
+            "boxid": "BoxID",
+            "ttn": "TTN",
+            "user": "Користувач",
+            "note": "Примітка",
+        }
+        for col, text in headings.items():
+            self.tree.heading(col, text=text)
+            self.tree.column(col, width=180 if col == "datetime" else 140, anchor="center")
+        self.tree.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+        self.fetch_history()
+
+    def _add_filter_entry(self, parent: tk.Widget, label: str, variable: tk.StringVar) -> None:
+        frame = tk.Frame(parent)
+        frame.pack(side="left", padx=4)
+        tk.Label(frame, text=label).pack(anchor="w")
+        entry = ttk.Entry(frame, textvariable=variable, width=16)
+        entry.pack()
+        entry.bind("<KeyRelease>", lambda _: self.apply_filters())
+
+    def pick_date(self) -> None:
+        value = simpledialog.askstring("Дата", "Введіть дату у форматі ДД.ММ.РРРР", parent=self)
+        if value:
+            try:
+                self.date_filter = datetime.strptime(value, "%d.%m.%Y").date()
+            except ValueError:
+                messagebox.showerror("Помилка", "Невірний формат дати")
+                return
+        else:
+            self.date_filter = None
+        self.apply_filters()
+
+    def pick_time(self, is_start: bool) -> None:
+        value = simpledialog.askstring("Час", "Введіть час у форматі ГГ:ХХ", parent=self)
+        if value:
+            try:
+                parsed = datetime.strptime(value, "%H:%M").time()
+            except ValueError:
+                messagebox.showerror("Помилка", "Невірний формат часу")
+                return
+            if is_start:
+                self.start_time = parsed
+            else:
+                self.end_time = parsed
+        else:
+            if is_start:
+                self.start_time = None
+            else:
+                self.end_time = None
+        self.apply_filters()
+
+    def clear_filters(self) -> None:
+        self.box_filter.set("")
+        self.ttn_filter.set("")
+        self.user_filter.set("")
+        self.date_filter = None
+        self.start_time = None
+        self.end_time = None
+        self.apply_filters()
+
+    def fetch_history(self) -> None:
+        token = self.app.state_data.token
+        if not token:
+            messagebox.showerror("Помилка", "Необхідна авторизація")
+            return
+
+        def worker() -> None:
+            try:
+                response = requests.get(
+                    f"{API_BASE}/get_history",
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=10,
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    fallback = datetime.min.replace(tzinfo=timezone.utc)
+                    data.sort(
+                        key=lambda r: self._parse_datetime(r.get("datetime")) or fallback,
+                        reverse=True,
+                    )
+                    self.records = data
+                    self.after(0, self.apply_filters)
+                else:
+                    raise requests.RequestException(f"status {response.status_code}")
+            except requests.RequestException as exc:
+                self.after(0, lambda: messagebox.showerror("Помилка", f"Не вдалося завантажити історію: {exc}"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def apply_filters(self) -> None:
+        filtered = list(self.records)
+        if self.box_filter.get():
+            needle = self.box_filter.get().strip()
+            filtered = [r for r in filtered if needle.lower() in str(r.get("boxid", "")).lower()]
+        if self.ttn_filter.get():
+            needle = self.ttn_filter.get().strip()
+            filtered = [r for r in filtered if needle.lower() in str(r.get("ttn", "")).lower()]
+        if self.user_filter.get():
+            needle = self.user_filter.get().strip()
+            filtered = [r for r in filtered if needle.lower() in str(r.get("user_name", "")).lower()]
+        if self.date_filter:
+            filtered = [
+                r
+                for r in filtered
+                if self._parse_datetime(r.get("datetime"))
+                and self._parse_datetime(r.get("datetime")).date() == self.date_filter
+            ]
+        if self.start_time or self.end_time:
+            tmp = []
+            for r in filtered:
+                dt = self._parse_datetime(r.get("datetime"))
+                if not dt:
+                    continue
+                tm = dt.time()
+                if self.start_time and tm < self.start_time:
+                    continue
+                if self.end_time and tm > self.end_time:
+                    continue
+                tmp.append(r)
+            filtered = tmp
+
+        self.filtered = filtered
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+        for item in filtered:
+            dt = self._parse_datetime(item.get("datetime"))
+            dt_txt = dt.strftime("%d.%m.%Y %H:%M:%S") if dt else item.get("datetime", "")
+            self.tree.insert(
+                "",
+                "end",
+                values=(
+                    dt_txt,
+                    item.get("boxid", ""),
+                    item.get("ttn", ""),
+                    item.get("user_name", ""),
+                    item.get("note", ""),
+                ),
+            )
+
+    def clear_history(self) -> None:
+        if not messagebox.askyesno("Підтвердження", "Очистити історію? Це незворотньо."):
+            return
+        token = self.app.state_data.token
+        if not token:
+            return
+
+        def worker() -> None:
+            try:
+                response = requests.delete(
+                    f"{API_BASE}/clear_tracking",
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=10,
+                )
+                if response.status_code == 200:
+                    def update() -> None:
+                        self.records.clear()
+                        self.apply_filters()
+
+                    self.after(0, update)
+                else:
+                    raise requests.RequestException(f"status {response.status_code}")
+            except requests.RequestException as exc:
+                self.after(0, lambda: messagebox.showerror("Помилка", f"Не вдалося очистити: {exc}"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @staticmethod
+    def _parse_datetime(value: Optional[str]) -> Optional[datetime]:
+        if not value:
             return None
         try:
-            return resp.json()
-        except Exception:
-            return resp.text
-
-    # POST /login?password=...
-    def login(self, password: str) -> Dict[str, Any]:
-        r = requests.post(
-            f"{self.base_url}/login",
-            params={"password": password},
-            headers={"Accept": "application/json"},
-            timeout=10,
-        )
-        data = self._handle(r)
-        if not isinstance(data, dict) or "token" not in data:
-            raise ApiError("Unexpected login response")
-        return data
-
-    # POST /add_record
-    def add_record(self, token: str, record: Dict[str, str]) -> Dict[str, Any]:
-        r = requests.post(
-            f"{self.base_url}/add_record",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
-            json=record,
-            timeout=10,
-        )
-        data = self._handle(r)
-        return data if isinstance(data, dict) else {}
-
-    # GET /get_history
-    def get_history(self, token: str) -> List[Dict[str, Any]]:
-        r = requests.get(
-            f"{self.base_url}/get_history",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=10,
-        )
-        data = self._handle(r)
-        if isinstance(data, list):
-            return data
-        raise ApiError("Unexpected history response")
-
-    # GET /get_errors
-    def get_errors(self, token: str) -> List[Dict[str, Any]]:
-        r = requests.get(
-            f"{self.base_url}/get_errors",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=10,
-        )
-        data = self._handle(r)
-        if isinstance(data, list):
-            return data
-        raise ApiError("Unexpected errors response")
-
-    # DELETE /clear_errors
-    def clear_errors(self, token: str) -> None:
-        r = requests.delete(
-            f"{self.base_url}/clear_errors",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=10,
-        )
-        self._handle(r)
-
-    # DELETE /delete_error/{id}
-    def delete_error(self, token: str, error_id: int) -> None:
-        r = requests.delete(
-            f"{self.base_url}/delete_error/{error_id}",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=10,
-        )
-        self._handle(r)
-
-
-API = ApiClient()
-
-
-# ------------------ Уровни доступа ------------------
-# 0 = ограниченный (оператор): Сканування, Історія, Помилки; нельзя удалять всё
-# 1 = админ: всё то же + может удалять/очищать ошибки и редактировать Довідку
-# 2 = только просмотр: видит Історія, Помилки, Довідка; без редактирования/сканирования
-
-def apply_access_to_tabs(tab_control: ttk.Notebook, tabs: Dict[str, ttk.Frame], access_level: int) -> None:
-    # Скрываем/отключаем вкладки
-    # Сканування скрыть для уровня 2
-    if access_level == 2:
-        try:
-            tab_control.tab(tabs["scan"], state='hidden')
-        except Exception:
-            pass
-    else:
-        try:
-            tab_control.tab(tabs["scan"], state='normal')
-        except Exception:
-            pass
-
-
-# ------------------ Вспомогательные UI-функции ------------------
-
-def add_copy_paste_to_entry(entry: tk.Entry) -> None:
-    def cut_text(e=None):
-        entry.event_generate("<<Cut>>"); return "break"
-
-    def copy_text(e=None):
-        entry.event_generate("<<Copy>>"); return "break"
-
-    def paste_text(e=None):
-        entry.event_generate("<<Paste>>"); return "break"
-
-    menu = tk.Menu(entry, tearoff=0)
-    menu.add_command(label="Вырезать", command=cut_text)
-    menu.add_command(label="Копировать", command=copy_text)
-    menu.add_command(label="Вставить", command=paste_text)
-
-    def show_menu(event):
-        menu.tk_popup(event.x_root, event.y_root)
-
-    entry.bind("<Button-3>", show_menu)
-    entry.bind("<Control-c>", copy_text)
-    entry.bind("<Control-x>", cut_text)
-    entry.bind("<Control-v>", paste_text)
-
-
-def add_copy_paste_to_text(text_widget: tk.Text) -> None:
-    def cut_text(e=None):
-        text_widget.event_generate("<<Cut>>"); return "break"
-
-    def copy_text(e=None):
-        text_widget.event_generate("<<Copy>>"); return "break"
-
-    def paste_text(e=None):
-        text_widget.event_generate("<<Paste>>"); return "break"
-
-    menu = tk.Menu(text_widget, tearoff=0)
-    menu.add_command(label="Вырезать", command=cut_text)
-    menu.add_command(label="Копировать", command=copy_text)
-    menu.add_command(label="Вставить", command=paste_text)
-
-    def show_menu(event):
-        menu.tk_popup(event.x_root, event.y_root)
-
-    text_widget.bind("<Button-3>", show_menu)
-    text_widget.bind("<Control-c>", copy_text)
-    text_widget.bind("<Control-x>", cut_text)
-    text_widget.bind("<Control-v>", paste_text)
-
-
-def add_right_click_menu_treeview(tree: ttk.Treeview) -> None:
-    menu = tk.Menu(tree, tearoff=0)
-    menu.add_command(label="Скопировать ячейку", command=lambda: copy_selected_cell(tree))
-    menu.add_command(label="Скопировать всю строку", command=lambda: copy_selected_row(tree))
-
-    def show_menu(event):
-        row_id = tree.identify_row(event.y)
-        col_id = tree.identify_column(event.x)
-        if not row_id:
-            return
-        tree.selection_set(row_id)
-        tree.clicked_row = row_id
-        tree.clicked_col = col_id
-        menu.tk_popup(event.x_root, event.y_root)
-
-    tree.bind("<Button-3>", show_menu)
-
-
-def copy_selected_cell(tree: ttk.Treeview) -> None:
-    try:
-        row_id = getattr(tree, "clicked_row", None)
-        col_id = getattr(tree, "clicked_col", None)
-        if not row_id or not col_id:
-            return
-        col_index = int(col_id.replace('#', '')) - 1
-        values = tree.item(row_id, "values")
-        if 0 <= col_index < len(values):
-            cell_value = values[col_index]
-            tree.clipboard_clear()
-            tree.clipboard_append(cell_value)
-    except Exception:
-        pass
-
-
-def copy_selected_row(tree: ttk.Treeview) -> None:
-    try:
-        row_id = getattr(tree, "clicked_row", None)
-        if not row_id:
-            return
-        values = tree.item(row_id, "values")
-        row_str = "\t".join(str(v) for v in values)
-        tree.clipboard_clear()
-        tree.clipboard_append(row_str)
-    except Exception:
-        pass
-
-
-# ------------------ Хелпер по датам ------------------
-
-def parse_iso_to_local_str(timestamp: Optional[str]) -> str:
-    if not timestamp:
-        return ""
-    try:
-        # допускаем ISO в формате с Z
-        ts = timestamp.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(ts)
-        # без pytz: просто вернём как есть в локальном представлении
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return timestamp
-
-
-# ------------------ Главное приложение ------------------
-
-class App:
-    def __init__(self) -> None:
-        self.window = tk.Tk()
-        self.window.title("TrackinApp API (Tkinter)")
-        try:
-            self.window.state('zoomed')
-        except Exception:
-            self.window.geometry("1200x800")
-
-        style = ttk.Style()
-        style.configure("TNotebook.Tab", font=("Arial", 16))
-
-        self.tab_control = ttk.Notebook(self.window)
-
-        # Вкладки
-        self.scan_tab = ttk.Frame(self.tab_control)
-        self.history_tab = ttk.Frame(self.tab_control)
-        self.errors_tab = ttk.Frame(self.tab_control)
-        self.help_tab = ttk.Frame(self.tab_control)
-
-        self.tab_control.add(self.scan_tab, text='Сканування')
-        self.tab_control.add(self.history_tab, text='Історія')
-        self.tab_control.add(self.errors_tab, text='Помилки')
-        self.tab_control.add(self.help_tab, text='Довідка')
-        self.tab_control.pack(expand=1, fill='both')
-
-        # Статус синхронизации
-        self.status_bar = tk.Label(self.window, text="", anchor="w")
-        self.status_bar.pack(side="bottom", fill="x")
-
-        # Доступ
-        self.user_access_level = int(CONFIG.get("access_level", 2))
-        self.token: Optional[str] = CONFIG.get("token")
-
-        # Инициализация интерфейса
-        self._build_scan_tab()
-        self._build_history_tab()
-        self._build_errors_tab()
-        self._build_help_tab()
-
-        # Применить права (скрыть вкладки при необходимости)
-        apply_access_to_tabs(self.tab_control, {
-            "scan": self.scan_tab
-        }, self.user_access_level)
-
-        # Запустить цикл синхронизации офлайна
-        self._schedule_sync()
-
-        # Открыть окно логина
-        self._check_login()
-
-    # ---------- ЛОГИН ----------
-
-    def _check_login(self) -> None:
-        if not self.token:
-            self._show_login_dialog()
-        else:
-            # Попросим имя оператора (если пустое)
-            if not CONFIG.get("user_name"):
-                self._prompt_user_name()
-
-    def _show_login_dialog(self) -> None:
-        dlg = tk.Toplevel(self.window)
-        dlg.title("Введіть пароль")
-        dlg.grab_set()
-        dlg.geometry("500x200")
-        ttk.Label(dlg, text="Будь ласка, введіть пароль:", font=("Arial", 14)).pack(pady=20)
-        pwd = tk.Entry(dlg, font=("Arial", 14), show="*", width=30)
-        pwd.pack(pady=10)
-        pwd.focus_set()
-
-        status = ttk.Label(dlg, text="", foreground="red")
-        status.pack(pady=5)
-
-        def submit():
-            password = pwd.get().strip()
-            if not password:
-                status.config(text="Пароль порожній")
-                return
+            dt = datetime.fromisoformat(value)
+            if dt.tzinfo is None:
+                return dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone()
+        except ValueError:
             try:
-                data = API.login(password)
-            except Exception as e:
-                status.config(text=f"Помилка: {e}")
-                return
-            # сохранить токен и уровень доступа
-            CONFIG["token"] = data.get("token")
-            CONFIG["access_level"] = int(data.get("access_level", 2))
-            CONFIG["last_password"] = password
-            save_config(CONFIG)
-            self.token = CONFIG["token"]
-            self.user_access_level = CONFIG["access_level"]
+                return datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(
+                    tzinfo=timezone.utc
+                )
+            except ValueError:
+                return None
 
-            # применим доступ к вкладкам
-            apply_access_to_tabs(self.tab_control, {"scan": self.scan_tab}, self.user_access_level)
 
-            dlg.destroy()
-            # спросить имя пользователя, если не задано
-            if not CONFIG.get("user_name"):
-                self._prompt_user_name()
-            self._refresh_all()
+class ErrorsWindow(tk.Toplevel):
+    def __init__(self, app: TrackingApp, role_info: Dict[str, Any]) -> None:
+        super().__init__(app)
+        self.app = app
+        self.role_info = role_info
+        self.title("Журнал помилок")
+        self.geometry("900x650")
 
-        btn = ttk.Button(dlg, text="Увійти", command=submit)
-        btn.pack(pady=10)
-        dlg.bind("<Return>", lambda e: submit())
+        self.records: List[Dict[str, Any]] = []
 
-    def _prompt_user_name(self) -> None:
-        dlg = tk.Toplevel(self.window)
-        dlg.title("Введіть своє прізвище")
-        dlg.grab_set()
-        dlg.geometry("600x230")
-        ttk.Label(dlg, text="Введіть своє прізвище (оператор):", font=("Arial", 16)).pack(pady=20)
-        entry = tk.Entry(dlg, font=("Arial", 16), width=30)
-        entry.pack(pady=10)
-        entry.focus_set()
-        add_copy_paste_to_entry(entry)
+        toolbar = tk.Frame(self)
+        toolbar.pack(fill="x", padx=12, pady=8)
+        ttk.Button(toolbar, text="Оновити", command=self.fetch_errors).pack(side="left", padx=4)
+        if role_info.get("can_clear_errors"):
+            ttk.Button(toolbar, text="Очистити всі", command=self.clear_errors).pack(side="left", padx=4)
 
-        def submit():
-            name = entry.get().strip()
-            if not name:
-                messagebox.showerror("Помилка", "Будь-ласка введіть прізвище.")
-                return
-            CONFIG["user_name"] = name
-            save_config(CONFIG)
-            dlg.destroy()
+        columns = ("datetime", "boxid", "ttn", "user", "reason")
+        self.tree = ttk.Treeview(self, columns=columns, show="headings")
+        headings = {
+            "datetime": "Дата",
+            "boxid": "BoxID",
+            "ttn": "TTN",
+            "user": "Користувач",
+            "reason": "Причина",
+        }
+        for col, text in headings.items():
+            self.tree.heading(col, text=text)
+            self.tree.column(col, width=160 if col == "reason" else 140, anchor="center")
+        self.tree.pack(fill="both", expand=True, padx=12, pady=(0, 12))
 
-        ttk.Button(dlg, text="Зберегти", command=submit).pack(pady=10)
-        dlg.bind("<Return>", lambda e: submit())
+        if role_info.get("can_clear_errors"):
+            self.tree.bind("<Double-1>", self.delete_selected_error)
 
-    # ---------- СКАНУВАННЯ ----------
+        self.fetch_errors()
 
-    def _build_scan_tab(self) -> None:
-        self.scan_label = tk.Label(self.scan_tab, text="Введіть своє прізвище", font=("Arial", 48))
-        self.scan_label.pack(pady=20)
-
-        self.scan_entry = tk.Entry(self.scan_tab, font=("Arial", 36), width=25)
-        self.scan_entry.pack(pady=10)
-        self.scan_entry.focus_set()
-        add_copy_paste_to_entry(self.scan_entry)
-
-        # статус
-        self.scan_status = tk.Label(self.scan_tab, text="", font=("Arial", 18), fg="#2b72ff")
-        self.scan_status.pack(pady=10)
-
-        # счетчик офлайна
-        self.offline_label = tk.Label(self.scan_tab, text="Офлайн записів: 0", font=("Arial", 14))
-        self.offline_label.pack(pady=5)
-
-        # Привязки
-        self.scan_entry.bind('<Return>', self._on_enter_name)
-
-    def _on_enter_name(self, event=None):
-        user_name = self.scan_entry.get().strip()
-        if not user_name:
-            messagebox.showerror("Помилка", "Будь-ласка введіть своє прізвище.")
-            return
-        CONFIG["user_name"] = user_name
-        save_config(CONFIG)
-        self.scan_entry.delete(0, tk.END)
-        self.scan_label.config(text="Відскануйте BoxID:")
-        self.scan_entry.bind('<Return>', lambda evt: self._on_enter_boxid(evt, user_name))
-
-    def _on_enter_boxid(self, event, user_name: str):
-        self._boxid = self.scan_entry.get().strip()
-        if not self._boxid:
-            messagebox.showerror("Помилка", "BoxID не може бути порожнім")
-            return
-        self.scan_entry.delete(0, tk.END)
-        self.scan_label.config(text="Відскануйте ТТН:")
-        self.scan_entry.bind('<Return>', lambda evt: self._on_enter_ttn(evt, user_name, self._boxid))
-
-    def _on_enter_ttn(self, event, user_name: str, boxid: str):
-        ttn = self.scan_entry.get().strip()
-        if not ttn:
-            messagebox.showerror("Помилка", "ТТН не може бути порожнім.")
+    def fetch_errors(self) -> None:
+        token = self.app.state_data.token
+        if not token:
+            messagebox.showerror("Помилка", "Необхідна авторизація")
             return
 
-        record = {"user_name": user_name, "boxid": boxid, "ttn": ttn}
-
-        if not self.token:
-            messagebox.showwarning("Сесія", "Потрібно увійти знову")
-            self._show_login_dialog()
-            return
-
-        try:
-            resp = API.add_record(self.token, record)
-            note = resp.get("note") if isinstance(resp, dict) else None
-            if note:
-                self.scan_status.config(text=f"Дублікат: {note}", fg="#ff4d4d")
-            else:
-                self.scan_status.config(text="Успішно додано", fg="#2b9e43")
-            # после успешного добавления — попытка синка офлайна
-            self._sync_offline()
-        except Exception:
-            # офлайн — запишем в очередь
-            enqueue_offline(record)
-            self.scan_status.config(text="Офлайн: запис збережено локально", fg="#ff9f2d")
-
-        self.scan_entry.delete(0, tk.END)
-        self.scan_label.config(text="Відскануйте BoxID:")
-        self.scan_entry.bind('<Return>', lambda evt: self._on_enter_boxid(evt, user_name))
-        self._refresh_offline_count()
-        # обновим историю (если откроют вкладку)
-        self._reload_history()
-
-    def _refresh_offline_count(self) -> None:
-        self.offline_label.config(text=f"Офлайн записів: {pending_offline_count()}")
-
-    # ---------- ІСТОРІЯ ----------
-
-    def _build_history_tab(self) -> None:
-        history_label = tk.Label(self.history_tab, text="Історія сканування", font=("Arial", 36))
-        history_label.pack(pady=10)
-
-        filter_frame = ttk.Frame(self.history_tab)
-        filter_frame.pack(pady=10, fill='x')
-
-        tk.Label(filter_frame, text="Хто відсканував", font=("Arial", 14)).grid(row=0, column=0, padx=5, sticky="w")
-        self.filter_user_entry = tk.Entry(filter_frame, font=("Arial", 14), width=30)
-        self.filter_user_entry.grid(row=0, column=1, padx=5)
-        add_copy_paste_to_entry(self.filter_user_entry)
-        self.filter_user_entry.bind("<KeyRelease>", lambda e: self._reload_history())
-
-        tk.Label(filter_frame, text="Дата:", font=("Arial", 14)).grid(row=0, column=3, padx=5, sticky="w")
-        self.filter_date_entry = DateEntry(
-            filter_frame, font=("Arial", 14), width=20, date_pattern='y-mm-dd',
-            showerror=False
-        )
-        self.filter_date_entry.grid(row=0, column=4, padx=5)
-        add_copy_paste_to_entry(self.filter_date_entry)
-        # по умолчанию поле очищаем — как в первой версии
-        self.filter_date_entry.delete(0, "end")
-        self.filter_date_entry.bind("<<DateEntrySelected>>", lambda e: self._reload_history())
-        self.filter_date_entry.bind("<KeyRelease>", lambda e: self._reload_history())
-
-        tk.Label(filter_frame, text="Номер BoxID:", font=("Arial", 14)).grid(row=1, column=0, padx=5, sticky="w")
-        self.filter_boxid_entry = tk.Entry(filter_frame, font=("Arial", 14), width=30)
-        self.filter_boxid_entry.grid(row=1, column=1, padx=5)
-        add_copy_paste_to_entry(self.filter_boxid_entry)
-        self.filter_boxid_entry.bind("<KeyRelease>", lambda e: self._reload_history())
-
-        tk.Label(filter_frame, text="Номер ТТН:", font=("Arial", 14)).grid(row=1, column=3, padx=5, sticky="w")
-        self.filter_ttn_entry = tk.Entry(filter_frame, font=("Arial", 14), width=30)
-        self.filter_ttn_entry.grid(row=1, column=4, padx=5)
-        add_copy_paste_to_entry(self.filter_ttn_entry)
-        self.filter_ttn_entry.bind("<KeyRelease>", lambda e: self._reload_history())
-
-        self.show_duplicates_var = tk.BooleanVar()
-        dup_chk = tk.Checkbutton(
-            filter_frame, text="Показати тільки дублікати", font=("Arial", 14),
-            variable=self.show_duplicates_var, command=self._reload_history
-        )
-        dup_chk.grid(row=2, column=0, columnspan=2, pady=10, sticky='w')
-
-        # Таблица
-        tree_frame = tk.Frame(self.history_tab)
-        tree_frame.pack(fill='both', expand=True)
-
-        scrollbar = ttk.Scrollbar(tree_frame)
-        scrollbar.pack(side="right", fill="y")
-
-        self.history_tree = ttk.Treeview(
-            tree_frame,
-            columns=("User", "BoxID", "TTN", "DateTime", "Note"),
-            show='headings',
-            yscrollcommand=scrollbar.set
-        )
-        self.history_tree.heading("User", text="Хто вніс данні")
-        self.history_tree.heading("BoxID", text="Номер BoxID")
-        self.history_tree.heading("TTN", text="Номер ТТН НП")
-        self.history_tree.heading("DateTime", text="Дата та час внесення даних")
-        self.history_tree.heading("Note", text="Примітка")
-        self.history_tree.pack(fill='both', expand=True)
-
-        scrollbar.config(command=self.history_tree.yview)
-        add_right_click_menu_treeview(self.history_tree)
-
-        self.history_tree.tag_configure("duplicate", background="yellow")
-
-        # внутренний кэш истории
-        self._history_cache: List[Dict[str, Any]] = []
-
-        # кнопки "дубликат ОК" как в первой версии — удалены (нет note в API для редактирования)
-        # отрисовка будет подсвечивать дубли на лету (клиентская эвристика)
-
-    def _reload_history(self) -> None:
-        # фильтрация локально по кэшу
-        user_filter = self.filter_user_entry.get().strip().lower()
-        date_filter = self.filter_date_entry.get().strip()
-        boxid_filter = self.filter_boxid_entry.get().strip().lower()
-        ttn_filter = self.filter_ttn_entry.get().strip().lower()
-        show_duplicates = self.show_duplicates_var.get()
-
-        for i in self.history_tree.get_children():
-            self.history_tree.delete(i)
-
-        rows = []
-        for rec in self._history_cache:
-            uname = str(rec.get("user_name", "")).lower()
-            boxid = str(rec.get("boxid", "")).lower()
-            ttn = str(rec.get("ttn", "")).lower()
-            dt = parse_iso_to_local_str(rec.get("datetime"))
-            note = str(rec.get("note", ""))
-
-            if user_filter and not uname.startswith(user_filter):
-                continue
-            if date_filter and not dt.startswith(date_filter):
-                continue
-            if boxid_filter and not boxid.startswith(boxid_filter):
-                continue
-            if ttn_filter and not ttn.startswith(ttn_filter):
-                continue
-            rows.append((rec.get("user_name", ""), rec.get("boxid", ""), rec.get("ttn", ""), dt, note))
-
-        # клиентская подсветка дублей, если note не пришло
-        # критерии дубля: повторяющийся (boxid, ttn) или повтор boxid либо ttn
-        pair_count: Dict[str, int] = {}
-        box_count: Dict[str, int] = {}
-        ttn_count: Dict[str, int] = {}
-
-        for _, b, t, _, _ in rows:
-            pair_key = f"{b}|{t}"
-            pair_count[pair_key] = pair_count.get(pair_key, 0) + 1
-            box_count[b] = box_count.get(b, 0) + 1
-            ttn_count[t] = ttn_count.get(t, 0) + 1
-
-        for row in rows:
-            uname, b, t, dt, note = row
-            is_dup = False
-            if note:
-                is_dup = True
-            else:
-                if pair_count.get(f"{b}|{t}", 0) > 1 or box_count.get(b, 0) > 1 or ttn_count.get(t, 0) > 1:
-                    is_dup = True
-                    if not note:
-                        note = "Можливий дублікат (клієнтська перевірка)"
-            values = (uname, b, t, dt, note)
-
-            if show_duplicates:
-                if is_dup:
-                    self.history_tree.insert("", tk.END, values=values, tags=("duplicate",))
-            else:
-                if is_dup:
-                    self.history_tree.insert("", tk.END, values=values, tags=("duplicate",))
+        def worker() -> None:
+            try:
+                response = requests.get(
+                    f"{API_BASE}/get_errors",
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=10,
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    fallback = datetime.min.replace(tzinfo=timezone.utc)
+                    data.sort(
+                        key=lambda r: HistoryWindow._parse_datetime(r.get("datetime"))
+                        or fallback,
+                        reverse=True,
+                    )
+                    self.records = data
+                    self.after(0, self.render_records)
                 else:
-                    self.history_tree.insert("", tk.END, values=values)
+                    raise requests.RequestException(f"status {response.status_code}")
+            except requests.RequestException as exc:
+                self.after(0, lambda: messagebox.showerror("Помилка", f"Не вдалося завантажити: {exc}"))
 
-    def _load_history_from_api(self) -> None:
-        if not self.token:
+        threading.Thread(target=worker, daemon=True).start()
+
+    def render_records(self) -> None:
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+        for item in self.records:
+            dt = HistoryWindow._parse_datetime(item.get("datetime"))
+            dt_txt = dt.strftime("%d.%m.%Y %H:%M:%S") if dt else item.get("datetime", "")
+            reason = (
+                item.get("error_message")
+                or item.get("reason")
+                or item.get("note")
+                or item.get("message")
+                or item.get("error")
+                or "Причина не вказана"
+            )
+            self.tree.insert(
+                "",
+                "end",
+                iid=str(item.get("id", "")),
+                values=(
+                    dt_txt,
+                    item.get("boxid", ""),
+                    item.get("ttn", ""),
+                    item.get("user_name", ""),
+                    reason,
+                ),
+            )
+
+    def clear_errors(self) -> None:
+        if not messagebox.askyesno("Підтвердження", "Очистити журнал помилок?"):
             return
-        try:
-            data = API.get_history(self.token)
-            # сортировка по дате убыванию
-            data.sort(key=lambda d: d.get("datetime") or "", reverse=True)
-            self._history_cache = data
-            self._reload_history()
-        except Exception as e:
-            # тихо показывать ошибку разово можно в статусе
-            self._set_status(f"Помилка завантаження історії: {e}")
-
-    # ---------- ПОМИЛКИ ----------
-
-    def _build_errors_tab(self) -> None:
-        errors_label = tk.Label(self.errors_tab, text="Помилки сканування", font=("Arial", 36))
-        errors_label.pack(pady=10)
-
-        filter_frame = ttk.Frame(self.errors_tab)
-        filter_frame.pack(pady=10, fill='x')
-
-        tk.Label(filter_frame, text="Номер BoxID:", font=("Arial", 14)).grid(row=0, column=0, padx=5, sticky='w')
-        self.filter_boxid_entry_errors = tk.Entry(filter_frame, font=("Arial", 14), width=30)
-        self.filter_boxid_entry_errors.grid(row=0, column=1, padx=5)
-        add_copy_paste_to_entry(self.filter_boxid_entry_errors)
-        self.filter_boxid_entry_errors.bind("<KeyRelease>", lambda e: self._apply_errors_filter())
-
-        tk.Label(filter_frame, text="Номер ТТН:", font=("Arial", 14)).grid(row=0, column=3, padx=5, sticky='w')
-        self.filter_ttn_entry_errors = tk.Entry(filter_frame, font=("Arial", 14), width=30)
-        self.filter_ttn_entry_errors.grid(row=0, column=4, padx=5)
-        add_copy_paste_to_entry(self.filter_ttn_entry_errors)
-        self.filter_ttn_entry_errors.bind("<KeyRelease>", lambda e: self._apply_errors_filter())
-
-        tree_frame = tk.Frame(self.errors_tab)
-        tree_frame.pack(fill='both', expand=True)
-
-        scrollbar_errors = ttk.Scrollbar(tree_frame)
-        scrollbar_errors.pack(side="right", fill="y")
-
-        self.errors_tree = ttk.Treeview(
-            tree_frame,
-            columns=("ID", "User", "BoxID", "TTN", "DateTime", "Message"),
-            show='headings',
-            yscrollcommand=scrollbar_errors.set
-        )
-        self.errors_tree.heading("ID", text="ID")
-        self.errors_tree.heading("User", text="Прізвище")
-        self.errors_tree.heading("BoxID", text="BoxID")
-        self.errors_tree.heading("TTN", text="ТТН")
-        self.errors_tree.heading("DateTime", text="Дата та час")
-        self.errors_tree.heading("Message", text="Повідомлення")
-        self.errors_tree.pack(fill='both', expand=True)
-
-        add_right_click_menu_treeview(self.errors_tree)
-        scrollbar_errors.config(command=self.errors_tree.yview)
-
-        # Кнопки действий, в зависимости от прав
-        btns = ttk.Frame(self.errors_tab)
-        btns.pack(pady=10)
-
-        self.btn_reload_errors = ttk.Button(btns, text="Завантажити помилки", command=self._load_errors_from_api)
-        self.btn_reload_errors.grid(row=0, column=0, padx=5)
-
-        self.btn_delete_selected_error = ttk.Button(
-            btns, text="Видалити виділену помилку", command=self._delete_selected_error
-        )
-        self.btn_delete_selected_error.grid(row=0, column=1, padx=5)
-
-        self.btn_clear_errors = ttk.Button(btns, text="Видалити всі помилки", command=self._clear_all_errors)
-        self.btn_clear_errors.grid(row=0, column=2, padx=5)
-
-        # ограничения доступов
-        self._apply_error_tab_permissions()
-
-        # кэш ошибок
-        self._errors_cache: List[Dict[str, Any]] = []
-
-    def _apply_error_tab_permissions(self) -> None:
-        # Только админ (1) может удалять/очищать ошибки
-        can_clear = self.user_access_level == 1
-        self.btn_delete_selected_error.config(state=("normal" if can_clear else "disabled"))
-        self.btn_clear_errors.config(state=("normal" if can_clear else "disabled"))
-
-    def _load_errors_from_api(self) -> None:
-        if not self.token:
+        token = self.app.state_data.token
+        if not token:
             return
-        try:
-            data = API.get_errors(self.token)
-            # ожидаем: [{id, user_name?, boxid, ttn, datetime, error_message?}]
-            data.sort(key=lambda d: d.get("datetime") or "", reverse=True)
-            self._errors_cache = data
-            self._apply_errors_filter()
-        except Exception as e:
-            self._set_status(f"Помилка завантаження помилок: {e}")
 
-    def _apply_errors_filter(self) -> None:
-        box_filter = self.filter_boxid_entry_errors.get().strip().lower()
-        ttn_filter = self.filter_ttn_entry_errors.get().strip().lower()
-
-        for i in self.errors_tree.get_children():
-            self.errors_tree.delete(i)
-
-        for rec in self._errors_cache:
-            rec_box = str(rec.get("boxid", "")).lower()
-            rec_ttn = str(rec.get("ttn", "")).lower()
-            if box_filter and not rec_box.startswith(box_filter):
-                continue
-            if ttn_filter and not rec_ttn.startswith(ttn_filter):
-                continue
-
-            self.errors_tree.insert("", tk.END, values=(
-                rec.get("id", ""),
-                rec.get("user_name", ""),
-                rec.get("boxid", ""),
-                rec.get("ttn", ""),
-                parse_iso_to_local_str(rec.get("datetime")),
-                rec.get("error_message", ""),
-            ))
-
-    def _delete_selected_error(self) -> None:
-        if self.user_access_level != 1:
-            return
-        if not self.token:
-            return
-        sel = self.errors_tree.selection()
-        if not sel:
-            return
-        item = self.errors_tree.item(sel[0])
-        values = item.get("values", [])
-        if not values:
-            return
-        try:
-            error_id = int(values[0])
-        except Exception:
-            return
-        if messagebox.askyesno("Видалення", f"Видалити помилку #{error_id}?"):
+        def worker() -> None:
             try:
-                API.delete_error(self.token, error_id)
-                self._load_errors_from_api()
-            except Exception as e:
-                messagebox.showerror("Помилка", str(e))
+                response = requests.delete(
+                    f"{API_BASE}/clear_errors",
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=10,
+                )
+                if response.status_code == 200:
+                    def update() -> None:
+                        self.records.clear()
+                        self.render_records()
 
-    def _clear_all_errors(self) -> None:
-        if self.user_access_level != 1:
+                    self.after(0, update)
+                else:
+                    raise requests.RequestException(f"status {response.status_code}")
+            except requests.RequestException as exc:
+                self.after(0, lambda: messagebox.showerror("Помилка", f"Не вдалося очистити: {exc}"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def delete_selected_error(self, event: tk.Event) -> None:
+        item_id = self.tree.focus()
+        if not item_id:
             return
-        if not self.token:
-            return
-        if messagebox.askyesno("Очищення помилок", "Видалити всі помилки?"):
-            try:
-                API.clear_errors(self.token)
-                self._load_errors_from_api()
-            except Exception as e:
-                messagebox.showerror("Помилка", str(e))
-
-    # ---------- ДОВІДКА ----------
-
-    def _build_help_tab(self) -> None:
-        help_text_label = tk.Label(self.help_tab, text="Інструкція по використанню програми", font=("Arial", 24))
-        help_text_label.pack(pady=10)
-
-        self.help_textbox = tk.Text(self.help_tab, wrap='word', font=("Arial", 14), height=20, width=80)
-        self.help_textbox.pack(pady=10, padx=10, fill='both', expand=True)
-        add_copy_paste_to_text(self.help_textbox)
-
-        # загрузить локальный help
-        self.help_textbox.insert(tk.END, self._load_help_text())
-        self.help_textbox.config(state='disabled')
-
-        if self.user_access_level == 1:
-            edit_button = tk.Button(self.help_tab, text="Добавить/Изменить инструкцію",
-                                    font=("Arial", 14), command=self._edit_help_text)
-            edit_button.pack(pady=5)
-
-    def _load_help_text(self) -> str:
-        if HELP_PATH.exists():
-            try:
-                return HELP_PATH.read_text(encoding="utf-8")
-            except Exception:
-                pass
-        return "Поки що інструкція відсутня. Натисніть «Добавить/Изменить инструкцію», щоб додати."
-
-    def _save_help_text(self, text: str) -> None:
         try:
-            HELP_PATH.write_text(text, encoding="utf-8")
-        except Exception:
-            pass
-
-    def _edit_help_text(self) -> None:
-        if self.user_access_level != 1:
+            record_id = int(float(item_id))
+        except ValueError:
             return
-        win = tk.Toplevel(self.window)
-        win.title("Редагувати інструкцію")
-        win.geometry("800x600")
-
-        txt = tk.Text(win, wrap='word', font=("Arial", 14))
-        txt.pack(padx=10, pady=10, fill='both', expand=True)
-        add_copy_paste_to_text(txt)
-        txt.insert(tk.END, self._load_help_text())
-
-        def save_and_close():
-            new_text = txt.get("1.0", tk.END).strip()
-            self._save_help_text(new_text)
-            self.help_textbox.config(state='normal')
-            self.help_textbox.delete("1.0", tk.END)
-            self.help_textbox.insert(tk.END, new_text)
-            self.help_textbox.config(state='disabled')
-            win.destroy()
-
-        tk.Button(win, text="Зберегти", command=save_and_close, font=("Arial", 14)).pack(pady=10)
-
-    # ---------- СИНХРОНИЗАЦИЯ ОФФЛАЙН ----------
-
-    def _sync_offline(self) -> None:
-        if not self.token:
-            self._refresh_offline_count()
+        if not messagebox.askyesno("Підтвердження", f"Видалити помилку #{record_id}?"):
             return
-        pending = dequeue_all_offline()
-        if not pending:
-            self._refresh_offline_count()
+        token = self.app.state_data.token
+        if not token:
             return
-        failed: List[Dict[str, str]] = []
-        for rec in pending:
+
+        def worker() -> None:
             try:
-                API.add_record(self.token, rec)
-            except Exception:
-                failed.append(rec)
-        for rec in failed:
-            enqueue_offline(rec)
-        self._refresh_offline_count()
-        if failed:
-            self._set_status("Статус: офлайн (є не передані записи)")
-        else:
-            self._set_status("Статус: онлайн (офлайн-чергу синхронізовано)")
-            # при успешном синке — обновим историю
-            self._load_history_from_api()
+                response = requests.delete(
+                    f"{API_BASE}/delete_error/{record_id}",
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=10,
+                )
+                if response.status_code == 200:
+                    def update() -> None:
+                        self.records = [
+                            r for r in self.records if r.get("id") != record_id
+                        ]
+                        self.render_records()
 
-    def _schedule_sync(self) -> None:
-        self.window.after(SYNC_INTERVAL_MS, self._scheduled_sync_tick)
+                    self.after(0, update)
+                else:
+                    raise requests.RequestException(f"status {response.status_code}")
+            except requests.RequestException as exc:
+                self.after(0, lambda: messagebox.showerror("Помилка", f"Не вдалося видалити: {exc}"))
 
-    def _scheduled_sync_tick(self) -> None:
-        try:
-            self._sync_offline()
-        finally:
-            self._schedule_sync()
-
-    # ---------- Обновления ----------
-
-    def _refresh_all(self) -> None:
-        self._refresh_offline_count()
-        self._load_history_from_api()
-        self._load_errors_from_api()
-
-    # ---------- Статус ----------
-
-    def _set_status(self, text: str) -> None:
-        self.status_bar.config(text=text)
-
-    # ---------- Mainloop ----------
-
-    def run(self) -> None:
-        self.window.mainloop()
+        threading.Thread(target=worker, daemon=True).start()
 
 
-# ------------------ Запуск ------------------
+def main() -> None:
+    app = TrackingApp()
+    app.mainloop()
 
-if __name__ == "__main__":
-    App().run()
+
+if __name__ == "__main__":  # pragma: no cover
+    main()
